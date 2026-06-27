@@ -33,6 +33,16 @@
         }
         .tab-btn.active { background-color: #ff9800; color: white; }
         
+        /* 빈 화면(데이터 없음) 안내 텍스트 */
+        .empty-state {
+            text-align: center;
+            color: #999;
+            grid-column: 1 / -1;
+            padding: 50px;
+            font-size: 18px;
+            font-weight: bold;
+        }
+
         /* 포스트잇 그리드 레이아웃 */
         .memo-container {
             display: grid;
@@ -61,7 +71,19 @@
         
         .name { font-size: 22px; font-weight: bold; border-bottom: 2px solid #e0c55f; padding-bottom: 5px; margin-bottom: 10px;}
         .hw { font-size: 14px; color: #555; margin-bottom: 10px; }
-        .intro { flex-grow: 1; font-size: 15px; line-height: 1.4; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; }
+        
+        /* 소개 내용 부분 (줄바꿈 인식 추가) */
+        .intro { 
+            flex-grow: 1; 
+            font-size: 15px; 
+            line-height: 1.4; 
+            overflow: hidden; 
+            text-overflow: ellipsis; 
+            display: -webkit-box; 
+            -webkit-line-clamp: 4; 
+            -webkit-box-orient: vertical; 
+            white-space: pre-wrap; /* 카톡 줄바꿈을 웹에서도 인식하게 하는 마법의 코드 */
+        }
         
         /* 하단 정보 (월 / 번호 / 링크) */
         .footer { display: flex; justify-content: space-between; align-items: center; margin-top: 10px; font-size: 12px; color: #666; font-weight: bold;}
@@ -81,31 +103,49 @@
         </div>
 
     <script>
-        // 파이썬 코드와 동일한 Firebase URL을 입력하세요.
-        const DB_URL = "https://your-project-id-default-rtdb.firebaseio.com/memos.json";
+        // 🛑 중요: 복사해두신 본인의 주소와 anon 키를 아래 따옴표 안에 정확히 넣어주세요!
+        // 주소 맨 끝에 ?select=* 가 지워지지 않도록 주의하세요.
+        const SUPABASE_URL = "https://ivqyxdtmyqopjlfaxdrj.supabase.co/rest/v1/";
+        const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Iml2cXl4ZHRteXFvcGpsZmF4ZHJqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODI1NDQzMjYsImV4cCI6MjA5ODEyMDMyNn0.cVLJ8vIAwPZp7CarO_J_fY4kGai4Yoe3yOvF-zjCBPQ";
+
         let allMemos = [];
 
         async function loadMemos() {
             try {
-                const response = await fetch(DB_URL);
+                // 수파베이스는 반드시 헤더에 열쇠를 넣어서 요청해야 합니다.
+                const response = await fetch(SUPABASE_URL, {
+                    method: "GET",
+                    headers: {
+                        "apikey": SUPABASE_ANON_KEY,
+                        "Authorization": `Bearer ${SUPABASE_ANON_KEY}`,
+                        "Content-Type": "application/json"
+                    }
+                });
+
+                if (!response.ok) {
+                    throw new Error(`통신 에러: ${response.status}`);
+                }
+
                 const data = await response.json();
-                if(data) {
-                    // 객체 형태를 배열로 변환
-                    allMemos = Object.values(data);
-                    // 기본값 '강아지' 렌더링
-                    renderMemos('강아지');
+                
+                if (data && !data.error) {
+                    allMemos = data; // 파이어베이스와 달리 데이터가 이미 배열([])로 들어옵니다.
+                    renderMemos('강아지'); // 처음 켰을 때 '강아지' 기본 렌더링
+                } else {
+                    console.error("데이터 오류:", data.error);
                 }
             } catch (error) {
-                console.error("데이터를 불러오는 중 오류 발생:", error);
+                console.error("서버와 통신하는 중 오류 발생:", error);
+                document.getElementById('memo-board').innerHTML = '<div class="empty-state">⚠️ 데이터를 불러오지 못했습니다. 주소와 키를 확인해주세요.</div>';
             }
         }
 
         function filterCategory(category, element) {
-            // 탭 디자인 변경
+            // 버튼 색상 변경 로직
             document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
             element.classList.add('active');
             
-            // 데이터 렌더링
+            // 클릭한 카테고리만 화면에 그리기
             renderMemos(category);
         }
 
@@ -115,9 +155,18 @@
 
             const filteredMemos = allMemos.filter(memo => memo.category === category);
             
+            // 데이터가 한 개도 없을 때 휑해 보이지 않도록 방어 코드
+            if (filteredMemos.length === 0) {
+                board.innerHTML = `<div class="empty-state">아직 등록된 ${category} 프로필이 없어요! 😢</div>`;
+                return;
+            }
+
             filteredMemos.forEach(memo => {
                 const postIt = document.createElement('div');
                 postIt.className = 'post-it';
+                
+                // 번호 파싱 에러 방지 (숫자로 들어올 경우를 대비해 문자로 강제 변환)
+                const displayId = memo.id ? String(memo.id).slice(-4) : "0000";
                 
                 postIt.innerHTML = `
                     <div class="name">${memo.name}</div>
@@ -126,14 +175,14 @@
                     <div class="footer">
                         <span>📅 ${memo.month}월 분양</span>
                         <a href="${memo.link}" target="_blank" class="link-btn">오픈톡 연결</a>
-                        <span>#${memo.id.slice(-4)}</span>
+                        <span>#${displayId}</span>
                     </div>
                 `;
                 board.appendChild(postIt);
             });
         }
 
-        // 페이지 로드 시 데이터 가져오기
+        // 창이 켜지자마자 데이터 불러오기 시작
         window.onload = loadMemos;
     </script>
 </body>

@@ -21,24 +21,30 @@
       overflow-x: auto;
     }
 
-    /* 제목 */
+    /* 제목 - 모바일 화면에서도 잘리지 않도록 max-width 구조로 개선 */
     h2{
-      width: 900px;
+      max-width: 900px;
+      width: 100%;
       margin: 10px auto -5px auto;
       text-align: left;
       font-size: 14px;
       font-weight: 700;
       color: #666;
       padding-left: 10px;
+      box-sizing: border-box;
     }
 
-    /* ⭐ 필터 버튼 영역 */
+    /* 필터 버튼 영역 - 모바일에서 버튼이 밀릴 때 아래로 자연스럽게 정렬되도록 flex-wrap 추가 */
     .filter-box{
-      width: 900px;
+      max-width: 900px;
+      width: 100%;
       margin: 10px auto 15px auto;
       display: flex;
+      flex-wrap: wrap;
       gap: 15px;
       padding-left: 10px;
+      box-sizing: border-box;
+      align-items: center;
     }
 
     .filter-btn{
@@ -57,20 +63,33 @@
       font-weight: 700;
     }
 
-    /* ⭐ 고정형 3열 포스트잇 보드 */
+    /* ⭐ 새롭게 추가된 지역 선택 드롭다운 스타일 */
+    .region-select {
+      padding: 6px 12px;
+      border-radius: 8px;
+      background: white;
+      border: 1px solid #ccc;
+      font-size: 14px;
+      cursor: pointer;
+      outline: none;
+    }
+
+    /* 고정형 가로폭 대신 화면 크기에 맞춰 열 개수가 변하는 유연한 보드로 개선 */
     .board{
-      width: 900px;
+      max-width: 900px;
+      width: 100%;
       margin: 20px auto;
       display: grid;
-      grid-template-columns: 250px 250px 250px;
+      grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
       column-gap: 35px;
       row-gap: 35px;
       justify-content: center;
+      padding: 0 10px;
+      box-sizing: border-box;
     }
 
-    /* ⭐ 포스트잇 */
+    /* 포스트잇 */
     .postit{
-      width:240px;
       padding:16px 14px;
       border-radius:12px;
       box-shadow:0 10px 40px var(--shadow), 0 2px 6px rgba(0,0,0,0.06);
@@ -148,17 +167,25 @@
 
 <body>
 
-  <!-- 제목 -->
-  <!-- <h2 id="title"></h2> -->
   <h2>
     <span id="title"></span>
     <span id="count" style="margin-left:10px; color:#888;">(today : 0)</span>
   </h2>
 
-  <!-- ⭐ 필터 버튼 -->
   <div class="filter-box">
     <button class="filter-btn active" id="btn-dog">🐶 강아지</button>
     <button class="filter-btn" id="btn-cat">🐱 고양이</button>
+    
+    <select id="region-select" class="region-select">
+      <option value="all">📍 전체 지역</option>
+      <option value="서울">서울</option>
+      <option value="경기">경기</option>
+      <option value="강원">강원</option>
+      <option value="충청">충청</option>
+      <option value="경상">경상</option>
+      <option value="전라">전라</option>
+      <option value="제주">제주</option>
+    </select>
   </div>
 
   <main class="board" id="board"></main>
@@ -168,11 +195,19 @@
     const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Iml2cXl4ZHRteXFvcGpsZmF4ZHJqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODI1NDQzMjYsImV4cCI6MjA5ODEyMDMyNn0.cVLJ8vIAwPZp7CarO_J_fY4kGai4Yoe3yOvF-zjCBPQ";
     const TABLE = "sale";
 
-    let allData = [];      // 전체 데이터
-    let currentType = "dog"; // ⭐ 처음 로드될 때 강아지만 표시
+    let allData = [];         // 전체 데이터 백업용
+    let currentType = "dog";    // 현재 보고 있는 동물 종류 (처음엔 강아지)
+    let currentRegion = "all";  // 현재 보고 있는 지역 (처음엔 전체 지역)
 
     async function loadData() {
       try {
+        // [디테일 반영] 데이터를 불러오는 동안 화면이 텅 비지 않도록 로딩 메시지 표시
+        document.getElementById("board").innerHTML = `
+          <div style="grid-column: 1 / -1; text-align: center; color: #888; padding: 50px 0;">
+            데이터를 불러오는 중입니다... 🐾
+          </div>
+        `;
+
         const res = await fetch(
           `${SUPABASE_URL}/rest/v1/${TABLE}?select=*`,
           {
@@ -198,11 +233,16 @@
 
         updateTitle(dogCount, catCount);
 
-        // 초기 로딩 → 강아지만 표시
-        renderCards(filterData("dog"));
+        // 첫 로딩 시, 정해진 필터 조건(강아지 + 전체지역)에 맞는 것만 출력
+        renderCards(filterData());
 
       } catch (err) {
         console.error("Fetch Error:", err);
+        document.getElementById("board").innerHTML = `
+          <div style="grid-column: 1 / -1; text-align: center; color: #d33; padding: 50px 0;">
+            데이터를 불러오는 데 실패했습니다. 화면을 새로고침해 주세요.
+          </div>
+        `;
       }
     }
 
@@ -226,8 +266,6 @@
         }
 
         const data = await res.json();
-
-        // 👉 반환값 형태 대응
         let count;
 
         if (typeof data === "number") {
@@ -238,38 +276,47 @@
           count = data?.count;
         }
 
-        // document.getElementById("count").innerText = count ?? "오류";
         updateCount(count);
 
       } catch (err) {
         console.error("RPC 호출 실패:", err);
-        document.getElementById("count").innerText = "불러오기 실패";
+        document.getElementById("count").innerText = "(today : 오류)";
       }
     }
 
     function updateTitle(count1, count2) {
       const titleEl = document.getElementById("title");
-      // const today = new Date().toISOString().slice(0, 10);
-      // titleEl.textContent = `강아지 ${count1}마리, 고양이 ${count2}마리 등록 (${today})`;
-
       titleEl.textContent = `강아지 ${count1}마리, 고양이 ${count2}마리 등록`;
     }
 
     function updateCount(count) {
       const countEl = document.getElementById("count");
-
       countEl.textContent = `(today : ${count})`;
     }
 
-    /* ⭐ type별 필터 */
-    function filterData(type) {
-      return allData.filter(item => item.type === type);
+    /* ⭐ 핵심 로직: 동물 종류와 지역 조건 2가지를 동시에 검사하여 필터링 */
+    function filterData() {
+      return allData.filter(item => {
+        const matchType = item.type === currentType;
+        const matchRegion = currentRegion === "all" || item.region === currentRegion;
+        return matchType && matchRegion;
+      });
     }
 
-    /* ⭐ 카드 렌더링 */
+    /* 카드 렌더링 */
     function renderCards(data) {
       const board = document.getElementById("board");
       board.innerHTML = "";
+
+      // [디테일 반영] 선택한 지역에 조건에 맞는 아이템이 한 개도 없을 때 예외 안내 처리
+      if (data.length === 0) {
+        board.innerHTML = `
+          <div style="grid-column: 1 / -1; text-align: center; color: #999; padding: 60px 0; font-size: 15px;">
+            선택하신 지역에 등록된 동물이 없습니다. 🐾
+          </div>
+        `;
+        return;
+      }
 
       data.forEach((item) => {
         const card = document.createElement("article");
@@ -278,7 +325,10 @@
         card.innerHTML = `
           <div class="pin">📌</div>
 
-          <h1>${item.nick_name ?? ""}</h1>
+          <h1>
+            ${item.nick_name ?? ""}
+            ${item.region ? `<span style="font-size:11px; color:#7a6b00; background:#fceb92; padding:2px 6px; border-radius:4px; margin-left:6px; font-weight:normal;">${item.region}</span>` : ""}
+          </h1>
 
           <p>📄 ${item.specification ?? ""}</p>
           <p>📝 ${item.memo ?? ""}</p>
@@ -308,20 +358,26 @@
       });
     }
 
-    /* ⭐ 버튼 클릭 이벤트 */
+    /* 버튼 클릭 이벤트 */
     document.getElementById("btn-dog").addEventListener("click", () => {
       currentType = "dog";
       setActive("dog");
-      renderCards(filterData("dog"));
+      renderCards(filterData());
     });
 
     document.getElementById("btn-cat").addEventListener("click", () => {
       currentType = "cat";
       setActive("cat");
-      renderCards(filterData("cat"));
+      renderCards(filterData());
     });
 
-    /* ⭐ 버튼 active 스타일 적용 */
+    /* ⭐ 새롭게 추가된 드롭다운 선택 이벤트 */
+    document.getElementById("region-select").addEventListener("change", (event) => {
+      currentRegion = event.target.value;
+      renderCards(filterData());
+    });
+
+    /* 버튼 active 스타일 적용 */
     function setActive(type) {
       document.getElementById("btn-dog").classList.remove("active");
       document.getElementById("btn-cat").classList.remove("active");

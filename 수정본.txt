@@ -1,0 +1,1279 @@
+import re
+import os
+import json
+import time
+import threading
+import requests
+import logging
+from datetime import datetime, timedelta
+from typing import Any
+from iris.bot import ChatContext
+
+logger = logging.getLogger(__name__)
+
+OPER_ROOM_ID = 18466473947529702
+
+# ==========================================
+# 1. 제미나이 AI 통신 (call_gemini)
+# ==========================================
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+question_history = {}
+
+def call_gemini(prompt: str, user_id: str = None) -> str:
+    """
+    prompt: AI에게 보낼 메세지
+    user_id: 대화 흐름을 기억하기 위한 사용자 ID (생략 시 단발성 질문으로 작동)
+    """
+    if not GEMINI_API_KEY: return "AI API 키가 설정되지 않았습니다."
+
+    # 1. 대화 내역(History) 구성
+    contents = []
+    if user_id:
+        if user_id not in question_history:
+            question_history[user_id] = []
+       
+        # 과거 내역 불러오기
+        contents.extend(question_history[user_id])
+        # 새로운 질문 추가
+        contents.append({"role": "user", "parts": [{"text": prompt}]})
+    else:
+        # user_id가 없으면 (예: 대기방 호출 등) 단발성 질문으로 처리
+        contents = [{"role": "user", "parts": [{"text": prompt}]}]
+
+    # API 요청 데이터 구성 (Google Search 도구 포함)
+    payload = {
+        "contents": contents,
+        "tools": [{"googleSearch": {}}] # [핵심] 실시간 정보 검색 기능 활성화
+    }
+
+    try:
+        # 검색 시간이 걸릴 수 있으므로 timeout을 30초로 늘렸습니다.
+        resp = requests.post(GEMINI_URL, headers={"Content-Type": "application/json"}, data=json.dumps(payload), timeout=30)
+        resp.raise_for_status()
+       
+        data = resp.json()
+        ans_text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+        # 2. 대화 내역 업데이트 (user_id가 있을 때만 저장)
+        if user_id:
+            # AI의 답변 기록 추가
+            question_history[user_id].append({"role": "model", "parts": [{"text": ans_text}]})
+            # 최신 왕복 5회(총 10개 메세지)만 유지하여 과도한 토큰 사용 방지
+            if len(question_history[user_id]) > 10:
+                question_history[user_id] = question_history[user_id][-10:]
+
+        return ans_text
+    except Exception as e:
+        logger.error(f"Gemini API Error: {e}")
+        return "⚠️ 답변 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요."
+
+# ==========================================
+# 2. Supabase 분양센터 연동
+# ==========================================
+def sale_api_url() -> str:
+    return os.getenv("SALE_API_URL") or "https://ivqyxdtmyqopjlfaxdrj.supabase.co/rest/v1/sale"
+
+def sale_api_key() -> str | None:
+    return os.getenv("SALE_API_KEY")
+
+def sale_site_url() -> str:
+    return os.getenv("SALE_SITE_URL") or "https://kinderpetsales.github.io/"
+
+def sale_headers(include_json: bool = True) -> dict:
+    apikey = sale_api_key()
+    headers = {
+        "apikey": apikey or "",
+        "Authorization": f"Bearer {apikey}" if apikey else "",
+        "Prefer": "return=representation",
+    }
+    if include_json:
+        headers["Content-Type"] = "application/json"
+    return headers
+
+def sale_get(params: dict) -> tuple[bool, str, object]:
+    apikey = sale_api_key()
+    if not apikey: return False, "SALE_API_KEY 미설정(.env)", None
+    url = sale_api_url()
+    try:
+        r = requests.get(url, headers=sale_headers(include_json=False), params=params, timeout=(3.0, 10.0))
+        if 200 <= r.status_code < 300:
+            try: return True, f"ok({r.status_code})", r.json()
+            except Exception: return True, f"ok({r.status_code})", r.text
+        return False, f"http {r.status_code}: {r.text[:300]}", None
+    except Exception as e: return False, f"exception: {e}", None
+
+def sale_patch_by_id(sale_id: int | str, patch_payload: dict) -> tuple[bool, str, object]:
+    apikey = sale_api_key()
+    if not apikey: return False, "SALE_API_KEY 미설정(.env)", None
+    url = sale_api_url()
+    try:
+        r = requests.patch(url, headers=sale_headers(include_json=True), params={"id": f"eq.{sale_id}"}, data=json.dumps(patch_payload), timeout=(3.0, 10.0))
+        if 200 <= r.status_code < 300:
+            try: return True, f"ok({r.status_code})", r.json()
+            except Exception: return True, f"ok({r.status_code})", r.text
+        return False, f"http {r.status_code}: {r.text[:300]}", None
+    except Exception as e: return False, f"exception: {e}", None
+
+def sale_delete_by_id(sale_id: int | str) -> tuple[bool, str, object]:
+    apikey = sale_api_key()
+    if not apikey: return False, "SALE_API_KEY 미설정(.env)", None
+    url = sale_api_url()
+    try:
+        r = requests.delete(url, headers=sale_headers(include_json=False), params={"id": f"eq.{sale_id}"}, timeout=(3.0, 10.0))
+        if 200 <= r.status_code < 300:
+            try: return True, f"ok({r.status_code})", r.json()
+            except Exception: return True, f"ok({r.status_code})", r.text
+        return False, f"http {r.status_code}: {r.text[:300]}", None
+    except Exception as e: return False, f"exception: {e}", None
+
+def sale_delete_by_valid_month(month: int) -> tuple[bool, str, object]:
+    apikey = sale_api_key()
+    if not apikey: return False, "SALE_API_KEY 미설정(.env)", None
+    url = sale_api_url()
+    try:
+        r = requests.delete(url, headers=sale_headers(include_json=False), params={"valid_month": f"eq.{int(month)}"}, timeout=(3.0, 10.0))
+        if 200 <= r.status_code < 300:
+            try: return True, f"ok({r.status_code})", r.json()
+            except Exception: return True, f"ok({r.status_code})", r.text
+        return False, f"http {r.status_code}: {r.text[:300]}", None
+    except Exception as e: return False, f"exception: {e}", None
+
+def sale_post(payload: dict) -> tuple[bool, str, object]:
+    apikey = sale_api_key()
+    if not apikey: return False, "SALE_API_KEY 미설정(.env)", None
+    url = sale_api_url()
+    try:
+        r = requests.post(url, headers=sale_headers(include_json=True), data=json.dumps(payload), timeout=(3.0, 10.0))
+        if 200 <= r.status_code < 300:
+            try: return True, f"ok({r.status_code})", r.json()
+            except Exception: return True, f"ok({r.status_code})", r.text
+        return False, f"http {r.status_code}: {r.text[:300]}", None
+    except Exception as e: return False, f"exception: {e}", None
+
+def extract_kor_nickname_from_profile_line(profile_line: str) -> str | None:
+    m = re.match(r"^([가-힣]{1,5})", (profile_line or "").strip())
+    return m.group(1) if m else None
+
+def sale_find_latest_row_by_profile_line(profile_line: str) -> tuple[bool, str, dict | None]:
+    ok, err, data = sale_get({
+        "select": "id,nick_name,valid_month,type,specification,link",
+        "nick_name": f"eq.{(profile_line or '').strip()}",
+        "order": "id.desc",
+        "limit": "1",
+    })
+    if ok and isinstance(data, list) and data and isinstance(data[0], dict):
+        return True, "ok", data[0]
+    return False, err or "not found", None
+
+def sale_find_latest_row_by_nickname_prefix(nickname: str) -> tuple[bool, str, dict | None]:
+    nn = (nickname or "").strip()
+    if not nn: return False, "empty nickname", None
+    
+    # 1. API 호출 시 limit을 늘려, 비슷한 이름을 가진 여러 후보를 가져옵니다.
+    ok, err, data = sale_get({
+        "select": "id,nick_name,valid_month,type,specification,link",
+        "nick_name": f"ilike.{nn}*",
+        "order": "id.desc",
+        "limit": "10", 
+    })
+    
+    # 2. 파이썬 단에서 정규식으로 정확한 경계(Boundary) 검사를 수행합니다.
+    if ok and isinstance(data, list) and data:
+        import re
+        # 핵심: 추출한 이름(nn) 바로 뒤에 다른 '한글'이 오지 않는 경우만 본인으로 인정
+        exact_match_pattern = re.compile(rf"^{nn}(?![가-힣])") 
+        
+        for row in data:
+            db_nickname = row.get("nick_name", "")
+            if exact_match_pattern.match(db_nickname):
+                return True, "ok", row
+                
+    return False, err or "not found", None
+
+def sale_compute_valid_month(now=None) -> int:
+    try:
+        from zoneinfo import ZoneInfo
+        now = now or datetime.now(ZoneInfo("Asia/Seoul"))
+    except Exception:
+        now = now or datetime.now()
+    if now.day <= 25: return int(now.month)
+    return 1 if int(now.month) == 12 else int(now.month) + 1
+
+def infer_sale_type_from_profile_line(profile_line: str) -> str | None:
+    parts = (profile_line or "").split("/")
+    role = parts[1].strip().upper() if len(parts) >= 2 else ""
+    if role.startswith("D"): return "cat"
+    if role.startswith("S"): return "dog"
+    return None
+
+def build_sale_payload_from_form(form_msg: str, chosen_text: str | None) -> tuple[dict, str | None]:
+    try:
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo("Asia/Seoul"))
+    except Exception:
+        now = datetime.now()
+
+    m = re.search(r"단톡방 프로필 풀네임\s*->\s*([^\n]+)", form_msg, re.I)
+    profile_line = m.group(1).strip() if m else ""
+
+    m = re.search(r"키/몸무게\s*->\s*([^\n]+)", form_msg, re.I)
+    hw_line = m.group(1).strip() if m else ""
+    specification = hw_line if hw_line else None
+
+    memo = ""
+    m = re.search(r"B\.\s*분양원하는조건.*?->\s*(.*?)(?:\n\s*C\.|\n\s*C\.)", form_msg, re.I | re.S)
+    if m: memo = m.group(1).strip()
+
+    m = re.search(r"(https?://open\.kakao\.com/[^\s]+)", form_msg, re.I)
+    link = m.group(1).strip() if m else ""
+
+    inferred_type = None
+    if chosen_text == "고양이": inferred_type = "cat"
+    elif chosen_text == "강아지": inferred_type = "dog"
+    else: inferred_type = infer_sale_type_from_profile_line(profile_line)
+
+    payload = {
+        "nick_name": profile_line,
+        "specification": specification,
+        "memo": memo,
+        "link": link,
+        "type": inferred_type,
+        "valid_month": sale_compute_valid_month(now),
+    }
+    return payload, inferred_type
+
+def send_kindergarten_sale_notice(bot_app, chosen_text: str) -> None:
+    from Main import KINDERGARTEN_ROOM_ID
+    base = sale_site_url().rstrip("/")
+    dog_url = f"{base}#"
+    cat_url = f"{base}"
+
+    if chosen_text == "강아지":
+        msg = ("📢[강아지 분양센터]\n🆕️[S]신규등록 알림\n\n상단 카테고리 [강아지] 선택\n" f"🔗{dog_url}")
+        bot_app.bot.api.reply(KINDERGARTEN_ROOM_ID, msg)
+        return
+
+    if chosen_text == "고양이":
+        msg = ("📢[고양이 분양센터]\n🆕️[D]신규등록 알림\n\n상단 카테고리 [고양이] 선택\n" f"🔗{cat_url}")
+        bot_app.bot.api.reply(KINDERGARTEN_ROOM_ID, msg)
+        return
+
+def send_oper_sale_notice(bot_app, ok: bool, author_profile: str, payload: dict, data: object, err: str) -> None:
+    from Main import OPER_ROOM_ID
+    base = sale_site_url().rstrip("/")
+    dog_url = f"{base}/#dog"
+    cat_url = f"{base}/#cat"
+
+    sale_id = None
+    if ok and isinstance(data, list) and data and isinstance(data[0], dict):
+        sale_id = data[0].get("id")
+
+    t = payload.get("type")
+    board_url = dog_url if t == "dog" else (cat_url if t == "cat" else base + "/")
+
+    if ok:
+        msg = (
+            "✅분양 자동등록 완료\n"
+            f"ID: {sale_id}\n성향: {t}\n프로필: {payload.get('nick_name')}\n"
+            f"분양 월: {payload.get('valid_month')}월\n링크: {payload.get('link')}\n보기: {board_url}"
+        )
+        bot_app.bot.api.reply(OPER_ROOM_ID, msg)
+        return
+
+    msg = (
+        "📌분양 자동등록 실패\n"
+        f"작성자: {author_profile}\n사유: {err}\nnick_name: {payload.get('nick_name')}\n보기: {base}/"
+    )
+    bot_app.bot.api.reply(OPER_ROOM_ID, msg)
+
+def send_oper_sale_edit_notice(bot_app, ok: bool, author_profile: str, target_row: dict | None, patch_payload: dict, data: object, err: str) -> None:
+    from Main import OPER_ROOM_ID
+    base = sale_site_url().rstrip("/")
+    dog_url = f"{base}/#dog"
+    cat_url = f"{base}/#cat"
+
+    sale_id = None
+    if target_row and isinstance(target_row, dict):
+        sale_id = target_row.get("id")
+
+    t = patch_payload.get("type")
+    board_url = dog_url if t == "dog" else (cat_url if t == "cat" else base + "/")
+
+    if ok:
+        bot_app.bot.api.reply(
+            OPER_ROOM_ID,
+            "✏️분양글 자동수정 완료\n"
+            f"작성자: {author_profile}\n대상ID: {sale_id}\n대상닉: {(target_row or {}).get('nick_name')}\n"
+            f"type: {t}\nvalid_month: {patch_payload.get('valid_month')}\nlink: {patch_payload.get('link')}\n보기: {board_url}"
+        )
+        return
+
+    bot_app.bot.api.reply(
+        OPER_ROOM_ID,
+        "📌분양글 자동수정 실패\n"
+        f"작성자: {author_profile}\n대상ID: {sale_id}\n대상닉: {(target_row or {}).get('nick_name')}\n"
+        f"사유: {err}\n보기: {base}/"
+    )
+
+def send_oper_sale_delete_notice(bot_app, ok: bool, author_profile: str, target_row: dict | None, data: object, err: str) -> None:
+    from Main import OPER_ROOM_ID
+    base = sale_site_url().rstrip("/")
+    sale_id = None
+    if target_row and isinstance(target_row, dict):
+        sale_id = target_row.get("id")
+
+    if ok:
+        deleted_count = len(data) if isinstance(data, list) else 0
+        bot_app.bot.api.reply(
+            OPER_ROOM_ID,
+            "🗑️분양글 자동삭제 완료\n"
+            f"요청자: {author_profile}\n대상ID: {sale_id}\n대상닉: {(target_row or {}).get('nick_name')}\n"
+            f"삭제건수: {deleted_count}\n보기: {base}/"
+        )
+        return
+
+    bot_app.bot.api.reply(
+        OPER_ROOM_ID,
+        "📌분양글 자동삭제 실패\n"
+        f"요청자: {author_profile}\n대상ID: {sale_id}\n대상닉: {(target_row or {}).get('nick_name')}\n"
+        f"사유: {err}\n보기: {base}/"
+    )
+
+def sale_monthly_Maintenance_tick(bot_app) -> None:
+    from Main import OPER_ROOM_ID
+    from datetime import datetime
+    try:
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo("Asia/Seoul"))
+    except Exception:
+        now = datetime.now()
+
+    if now.day != 1: return
+
+    today_key = now.strftime("%Y-%m-%d")
+    last_key = getattr(bot_app, "sale_last_cleanup_date", None)
+    if last_key == today_key: return
+
+    prev_month = 12 if now.month == 1 else (now.month - 1)
+    ok, err, data = sale_delete_by_valid_month(prev_month)
+
+    deleted_count = 0
+    if ok and isinstance(data, list):
+        deleted_count = len(data)
+
+    try:
+        if ok:
+            bot_app.bot.api.reply(
+                OPER_ROOM_ID,
+                f"🧹[분양센터 자동정리]\n전월({prev_month}월) 분양글 삭제 완료\n삭제건수: {deleted_count}"
+            )
+        else:
+            bot_app.bot.api.reply(
+                OPER_ROOM_ID,
+                f"🧹[분양센터 자동정리 실패]\n전월({prev_month}월) 삭제 실패\n사유: {err}"
+            )
+    except Exception: pass
+
+    bot_app.sale_last_cleanup_date = today_key
+
+def start_sale_Maintenance_scheduler(bot_app) -> None:
+    import threading
+    from datetime import datetime, timedelta
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo("Asia/Seoul")
+    except Exception:
+        tz = None
+
+    if getattr(bot_app, "_sale_Maint_thread_started", False): return
+    bot_app._sale_Maint_thread_started = True
+
+    def _loop():
+        try: sale_monthly_Maintenance_tick(bot_app)
+        except Exception: pass
+
+        while True:
+            try:
+                now = datetime.now(tz) if tz else datetime.now()
+                next_run = (now + timedelta(days=1)).replace(hour=0, minute=1, second=0, microsecond=0)
+                sleep_sec = (next_run - now).total_seconds()
+                if sleep_sec < 1: sleep_sec = 1
+            except Exception:
+                sleep_sec = 60
+
+            threading.Event().wait(sleep_sec)
+
+            try: sale_monthly_Maintenance_tick(bot_app)
+            except Exception: pass
+
+    t = threading.Thread(target=_loop, name="sale_Maintenance_scheduler", daemon=True)
+    t.start()
+
+# ==========================================
+# 3. 교무실 / 제미나이 라우터
+# ==========================================
+def gyomu_simple_intent_router(text: str) -> str:
+    t = text.strip()
+    if not t:
+        return (
+            "도와드리고 싶은데, 아직 어떤 용건인지 잘 모르겠어요🙂\n"
+            "분양, 외출/복귀, 지인초대, 퇴학, 제보/문의 중\n"
+            "어느 쪽에 가까운지 한 번만 더 말씀해주시면,\n"
+            "알맞은 번호(1~6)를 안내해드릴게요."
+        )
+
+    prompt = (
+        "너는 카카오톡 오픈채팅방 [댕냥이 유치원] 교무실의 AI 상담사야.\n"
+        "사용자가 어떤 도움을 원하는지 말하면,\n"
+        "아래 상담 메뉴 중 가장 적절한 번호 하나를 정확하게 골라.\n\n"
+        "상담 메뉴:\n"
+        "1: 분양센터 관련 (분양 신청/등록, 분양글 수정·삭제, 분양 관련 문의 등)\n"
+        "2: 외출/복귀 관련 (잠깐 나가있기, 방 나갔다가 다시 들어오기 등)\n"
+        "3: 지인 초대 관련 (친구/지인 초대, 초대 링크 공유 등)\n"
+        "4: 기타 문의 및 제보/신고 (불편사항 제보, 궁금한 점, 운영진에게 질문 등)\n"
+        "5: 퇴학 후 문의/재입학 (왜 강퇴·퇴학당했는지, 다시 들어오고 싶은 경우 등)\n"
+        "6: 초대받고 온 경우 (지인에게 초대받아서 들어온 사람 등)\n\n"
+        "반드시 다음 규칙을 지켜.\n"
+        "1) 1,2,3,4,5,6 중에서 [가장 알맞은 번호 하나만] 골라.\n"
+        "2) 오직 숫자 하나만 출력하고, 다른 말이나 기호는 쓰지 마.\n\n"
+        f"사용자 메시지: \"{t}\"\n"
+        "응답:"
+    )
+
+    try:
+        result = call_gemini(prompt)
+        digits = "".join(ch for ch in result if ch.isdigit())
+        if not digits: raise ValueError(f"Gemini 응답에서 숫자를 찾지 못했습니다: {result!r}")
+        code = digits[0]
+    except Exception as e:
+        logger.error(f"제미나이 메뉴 분류 오류: {e}", exc_info=True)
+        return (
+            "도와드리고 싶은데, 아직 어떤 용건인지 정확히 파악이 안 됐어요🙂\n"
+            "분양 등록/수정/삭제, 외출·복귀, 지인초대, 퇴학, 제보/문의 중\n"
+            "어느 쪽에 가까운지 한 번만 더 설명해주시면,\n"
+            "알맞은 번호(1~6)를 안내해드릴게요."
+        )
+
+    if code not in {"1", "2", "3", "4", "5", "6"}:
+        return (
+            "도와드리고 싶은데, 아직 어떤 용건인지 정확히 파악이 안 됐어요🙂\n"
+            "분양 등록/수정/삭제, 외출·복귀, 지인초대, 퇴학, 제보/문의 중\n"
+            "어느 쪽에 가까운지 한 번만 더 설명해주시면,\n"
+            "알맞은 번호(1~6)를 안내해드릴게요."
+        )
+
+    if code == "1":
+        return "분양센터 관련 문의로 보이네요🙂\n분양센터 메뉴는 [1번] 입니다.\n\n채팅창에 [1] 을 입력해주시면\n[분양 신규 등록 / 수정 / 삭제]에 대한\n세부 메뉴를 보여드릴게요."
+    if code == "2":
+        return "외출 또는 복귀 관련 문의 같아요🙂\n외출/복귀 메뉴는 [2번] 입니다.\n\n채팅창에 [2] 를 입력해주시면\n[외출(21) / 복귀(22)] 중에서 고르실 수 있어요."
+    if code == "3":
+        return "지인 초대 관련 문의로 이해했어요😊\n지인 초대 메뉴는 [3번] 입니다.\n\n채팅창에 [3] 을 입력해주시면\n지인에게 전달할 링크와 안내를 보여드릴게요."
+    if code == "4":
+        return "제보/신고 또는 기타 문의로 보이네요.\n기타 문의 및 제보 메뉴는 4번 입니다.\n\n채팅창에 [4] 를 입력해주시면\n[제보/신고(41) / 일반 문의(42)] 중에서\n선택하실 수 있어요."
+    if code == "5":
+        return "퇴학 이후의 문의나 재입학 관련 요청 같아요.\n퇴학 후 문의 메뉴는 5번 입니다.\n\n채팅창에 [5] 를 입력해주시면\n퇴학 사유 문의 및 재입학 안내를 도와드릴게요."
+    if code == "6":
+        return "초대받고 오신 손님 같네요🙋\n초대 입장 관련 메뉴는 [6번] 입니다.\n\n채팅창에 [6] 을 입력해주시면\n운영진에게 '초대받고 왔어요' 요청을 전달해드릴게요."
+    return "도와드리고 싶은데, 아직 어떤 용건인지 정확히 파악이 안 됐어요🙂\n분양 등록/수정/삭제, 외출·복귀, 지인초대, 퇴학, 제보/문의 중\n어느 쪽에 가까운지 한 번만 더 설명해주시면,\n알맞은 번호(1~6)를 안내해드릴게요."
+
+def handle_gyomu_gemini_chat(bot_app, ctx, msg: str) -> None:
+    if bot_app.gyomu_global_gemini_disabled:
+        return
+
+    user_id = ctx.sender.id
+    mode = bot_app.gyomu_mode.get(user_id, "menu")
+    author_profile = ctx.sender.name or ""
+    text = msg.strip()
+    if not text:
+        return
+
+    if mode == "out_reason":
+        handle_gyomu_out_reason_chat(bot_app, ctx, text, author_profile)
+        return
+
+    history = bot_app.gyomu_chat_history.get(user_id, [])
+    history.append({"role": "user", "text": text})
+    if len(history) > 10:
+        history = history[-10:]
+
+    log_lines = []
+    for turn in history:
+        role_kor = "사용자" if turn["role"] == "user" else "AI"
+        log_lines.append(f"{role_kor}: {turn['text']}")
+
+    base_prompt = f"""
+너는 카카오톡 오픈채팅방의 AI 상담사야.
+상담사는 친절하고 상냥하게 대하되, 간략하게 응대해.
+
+현재 대화 중인 사용자의 프로필(닉네임): "{author_profile}"
+
+- 사용자를 직접 부를 때는 반드시 위 닉네임을 대괄호 안에 그대로 포함해서 불러.
+예: "[{author_profile}] 님, ~~~", "[{author_profile}] 님 말씀처럼 ~~~"
+- 상담의 최종 목적은 사용자가 아래 1~6번 메뉴 중 하나를 스스로 선택해서
+  채팅창에 [숫자만] 입력하도록 자연스럽게 유도하는 거야.
+상담 메뉴:
+1: 분양센터 관련 (분양 신청/등록,수정·삭제, 분양 관련 문의 등)
+2: 외출/복귀 관련 (잠깐 나가있기, 외출 후 복귀 등)
+3: 지인 초대 관련 (친구/지인 초대, 초대 링크 공유 등)
+4: 기타 문의 및 제보/신고 (불편사항 제보, 궁금한 점, 운영진에게 질문 등)
+5: 퇴학 후 문의/재입학 (왜 강퇴·퇴학당했는지, 다시 들어오고 싶은 경우 등)
+6: 초대받고 온 경우 (지인에게 초대받아서 들어온 사람 등)
+
+규칙:
+- 인사(예: "안녕하세요")가 들어오면 먼저 반갑게 인사하고 어떤 용무로 방문했는지 자연스럽게 물어봐.
+- 사용자의 말을 충분히 들어주고, 질문을 섞어서 자유롭게 대화해.
+- 사용자의 상황이 어떤 메뉴(1~6)에 가장 가까운지 조용히 판단해서, "이 경우에는 5번 퇴학 후 문의가 어울릴 것 같아요. 채팅창에 5 라고만 입력해 주실래요?"
+처럼 부드럽게 설명하고 번호 입력을 제안해.
+- 한 번의 답변은 6줄 이하의 자연스러운 한국어 문장으로만 작성해.
+- 숫자만 따로 출력하지 말고, 항상 문장 안에서 자연스럽게 숫자를 섞어서 말해.
+"""
+
+    prompt = base_prompt + "\n\n[지금까지의 대화 로그]\n" + "\n".join(log_lines) + "\n\n위 대화를 이어서, 이제 AI 상담사로서 다음 한 번의 답변만 작성해."
+
+    try:
+        ai_reply = call_gemini(prompt)
+    except Exception as e:
+        logger.error("교무실 Gemini 상담 호출 오류: %s", e, exc_info=True)
+        fallback = gyomu_simple_intent_router(text)
+        ctx.reply(fallback)
+        return
+
+    if not ai_reply or not ai_reply.strip():
+        fallback = gyomu_simple_intent_router(text)
+        ctx.reply(fallback)
+        return
+
+    ai_reply = ai_reply.strip()
+    ctx.reply(ai_reply)
+
+    history.append({"role": "assistant", "text": ai_reply})
+    if len(history) > 10:
+        history = history[-10:]
+    bot_app.gyomu_chat_history[user_id] = history
+
+def handle_gyomu_out_reason_chat(bot_app, ctx, text: str, author_profile: str) -> None:
+    from Main import OPER_ROOM_ID, KINDERGARTEN_ROOM_ID
+    user_id = ctx.sender.id
+    t = text.strip()
+
+    if not t:
+        ctx.reply("외출 사유를 한 줄만 적어주시면 됩니다🙂\n예: 개인사유요 / 가족 일정 때문이에요 등")
+        return
+
+    if any(kw in t for kw in ["꼭 말", "꼭말", "말해야", "굳이", "말하기 싫", "말하긴 좀", "말안해", "말 안해"]):
+        ctx.reply("꼭 자세히 말씀해주지 않으셔도 괜찮아요🙂\n부담되신다면 그냥 '개인사유요' 정도로만 남겨주셔도 됩니다.")
+        return
+
+    bot_app.out_db.add_user(ctx.sender.id, author_profile)
+
+    ctx.reply(f"[{author_profile}] 님!\n외출 접수가 완료 되었어요🙋\n\n추후 재입장 희망시\n지금 사용하신 프로필과\n아래 링크를 보관하셨다가\n방문해주시면 됩니다\n\n기다리고 있을게요👋\nhttps://open.kakao.com/o/g7YxFiGg")    
+    
+    try:
+        admin_msg = f"📢외출 등록 알림\n작성자: {author_profile}\n사유: {t}"
+        bot_app.bot.api.reply(OPER_ROOM_ID, admin_msg)
+    except Exception as e:
+        logger.error("운영방 메시지 전송 실패(외출 등록): %s", e, exc_info=True)
+
+    try:
+        kinder_msg = f"🏃‍♂️ [{author_profile}] 님이 잠시 외출하십니다.\n\n금방 돌아오실 예정이니 모두 따뜻하게 배웅해 주세요!👋"
+        bot_app.bot.api.reply(KINDERGARTEN_ROOM_ID, kinder_msg)
+    except Exception as e:
+        logger.error("유치원 알림 전송 실패: %s", e, exc_info=True)
+
+    bot_app.gyomu_mode.pop(user_id, None)
+    bot_app.gyomu_gemini_on[user_id] = False
+    bot_app.gyomu_chat_history.pop(user_id, None)
+
+def handle_gyomusil_admin_notify(bot_app, ctx, text: str) -> None:
+    from Main import GYOMU_ROOM_ID, OPER_ROOM_ID
+    if ctx.room.id != GYOMU_ROOM_ID:
+        return
+
+    content = (text or "").strip()
+    if not content: return
+
+    author_name = ctx.sender.name or "알 수 없는 작성자"
+    lower_name = author_name.lower()
+
+    if content == "예":
+        for block in ["sw", "newb", "new b"]:
+            if block in lower_name: return
+        return
+
+    if content in ("21", "13"): return
+
+    GYOMU_ADMIN_TRIGGERS = {
+        "3": "📢지인 초대 예정입니다", "6": "📢초대받고 왔습니다\n응대해주세요",
+        "42": "📢일반 문의 상담 요청 도착", "43": "📢제보: 상담 요청 도착", "44": "📢제보 도착 알림",
+        "52": "📢퇴학 문의 도착", "53": "📢프로필 퇴학 문의 요청", "54": "📢재입학 신청서 도착",
+    }
+    title = GYOMU_ADMIN_TRIGGERS.get(content)
+    if not title: return
+
+    admin_msg = f"{title}\n작성자: {author_name}"
+    try: bot_app.bot.api.reply(OPER_ROOM_ID, admin_msg)
+    except Exception as e: logger.error("운영방 메시지 전송 실패(기본 트리거): %s", e, exc_info=True)
+
+def process_qna_final_registration(bot_app, ctx, user_id, payload, author_profile):
+    ok, err, data = sale_post(payload)
+
+    try:
+        send_oper_sale_notice(bot_app, ok, author_profile, payload, data, err)
+    except Exception: pass
+
+    if ok:
+        try:
+            chosen_text = "강아지" if payload.get("type") == "dog" else "고양이"
+            send_kindergarten_sale_notice(bot_app, chosen_text)
+        except Exception: pass
+
+        ctx.reply(f"[{author_profile}] 님!\n보내주신 분양정보를\n[{payload.get('valid_month')}월 분양]으로 등록 완료하였으며,\n분양센터에서 즉시 확인가능합니다🙆🏻‍♂️\n⬇️분양센터 확인하기⬇️\n🔗https://kinderpetsales.github.io\n\n추가 문의가 없으시다면\n[퇴장]부탁드립니다.🚪🏃")
+    else:
+        ctx.reply("분양글 자동등록에 실패했습니다.\n운영진이 확인할게요.\n\n추가 문의가 없으시다면\n[퇴장]부탁드립니다.🚪")
+
+    bot_app.gyomu_temp_adopt_data.pop(user_id, None)
+    if hasattr(bot_app, "gyomu_adopt_kind_prompt_type"):
+        bot_app.gyomu_adopt_kind_prompt_type.pop(user_id, None)
+    bot_app.gyomu_mode.pop(user_id, None)
+    bot_app.gyomu_gemini_on[user_id] = False
+    bot_app.gyomu_chat_history.pop(user_id, None)
+    return True
+
+def process_qna_final_edit(bot_app, ctx, user_id, temp_data, author_profile):
+    sale_id = temp_data["target_row"].get("id")
+    patch_payload = {
+        "nick_name": temp_data["nick_name"],
+        "specification": temp_data["specification"],
+        "memo": temp_data["memo"],
+        "type": temp_data["type"],
+        "link": temp_data["link"],
+        "valid_month": temp_data["valid_month"],
+    }
+    ok, err, data = sale_patch_by_id(sale_id, patch_payload)
+
+    try: send_oper_sale_edit_notice(bot_app, ok, author_profile, temp_data["target_row"], patch_payload, data, err)
+    except Exception: pass
+
+    if ok:
+        ctx.reply(f"[{author_profile}] 님!\n요청하신 분양글을\n[자동수정] 처리했습니다✏️\n\n추가 문의가 없으시다면\n[퇴장]부탁드립니다.🚪🏃")
+    else:
+        ctx.reply("분양글 자동수정에 실패했습니다.\n운영진이 확인할게요.\n\n추가 문의가 없으시다면\n[퇴장]부탁드립니다.🚪")
+
+    bot_app.gyomu_temp_edit_data.pop(user_id, None)
+    if hasattr(bot_app, "gyomu_sale_edit_kind_prompt_type"):
+        bot_app.gyomu_sale_edit_kind_prompt_type.pop(user_id, None)
+    bot_app.gyomu_mode.pop(user_id, None)
+    bot_app.gyomu_gemini_on[user_id] = False
+    bot_app.gyomu_chat_history.pop(user_id, None)
+    return True
+
+def handle_gyomu_message(bot_app: Any, ctx: ChatContext, text: str) -> bool:
+    from Main import GYOMU_ROOM_ID
+    if ctx.room.id != GYOMU_ROOM_ID:
+        return False
+   
+    msg = text
+    text = msg.strip()
+    author_profile = ctx.sender.name or ""
+    user_id = ctx.sender.id
+
+    handle_gyomusil_admin_notify(bot_app, ctx, text)
+    try: sale_monthly_Maintenance_tick(bot_app)
+    except Exception: pass
+
+    blocked_words = [
+        '섹시','가슴','야하다','야해','야한','흥분','돔','섭','바텀','엉덩이','오랄','섹스',
+        '형님','아다','보지','고추','꼬추','자지','디그','애널','정조대','발정','금딸','주인님',
+        '사정','입싸','안싸','찌찌','유두','하드','스팽','골든','자위','애무','본디지',
+        '피스팅','요도','복종','ㄷㄱㄹㅇㄷ','온플','영딸','조련','후빨','전립선','야하게',
+        '야하더','야했어','야했더','야했습','형아','야노','야동','변태'
+    ]
+    for w in blocked_words:
+        if w in msg:
+            ctx.reply('⛔사용할 수 없는\n단어가 포함되었습니다.\n수정 후 다시보내주세요.')
+            return True
+
+    current_mode = bot_app.gyomu_mode.get(user_id)
+
+    if text == "취소" and current_mode and current_mode.startswith("adopt_qna_"):
+        bot_app.gyomu_mode.pop(user_id, None)
+        if hasattr(bot_app, "gyomu_temp_adopt_data"):
+            bot_app.gyomu_temp_adopt_data.pop(user_id, None)
+        ctx.reply("진행 중인 분양센터 등록을 취소했습니다. 처음 메뉴로 돌아갑니다.")
+        return True
+    
+    if current_mode == "return_verify":
+        input_profile = text.strip()
+        
+        # 취소 처리
+        if input_profile == "취소":
+            ctx.reply("복귀 확인을 취소합니다.")
+            bot_app.gyomu_mode.pop(user_id, None)
+            return True
+
+        # 2차 검증: 이름으로 찾기
+        matched_uid, stored_name = bot_app.out_db.find_user_by_profile(input_profile)
+
+        if matched_uid:
+            # ✅ 2차 검증 성공 시에만 알림 전송
+            _send_return_success_notifications(bot_app, ctx, stored_name, user_id)
+        else:
+            # ❌ 최종 실패 시에만 운영진에게 도움 요청 알림
+            ctx.reply(f"죄송합니다. [{input_profile}] 프로필로 신청하신 외출 정보를 찾지 못했습니다.\n\n잠시 기다려주시면 운영진이 확인 후 응대해 드릴게요.")
+            
+            from Main import OPER_ROOM_ID
+            admin_msg = f"📢 복귀 확인 최종 실패\n입력한 이름: {input_profile}\n현재 닉네임: {author_profile}\n(명단에 기록이 없어 확인이 필요합니다)"
+            try:
+                bot_app.bot.api.reply(OPER_ROOM_ID, admin_msg)
+            except: pass
+
+        bot_app.gyomu_mode.pop(user_id, None)
+        return True
+    
+    elif current_mode == "adopt_qna_step1_confirm":
+        if text == "예":
+            # 💡 [디테일 1] 사용자가 "예"라고 했어도, 현재 프로필 양식이 규정에 맞는지 한 번 더 검사해야 합니다.
+            profile_line = author_profile
+            nick_match = re.match(r"^([가-힣]{1,5})", profile_line)
+            nickname = nick_match.group(1) if nick_match else None
+            
+            # 닉네임이 없거나 형식이 이상한 경우 수동 입력으로 넘김
+            if not nickname or len(profile_line) <= len(nickname):
+                bot_app.gyomu_mode[user_id] = "adopt_qna_step1"
+                ctx.reply(f"현재 프로필({profile_line}) 양식이 올바르지 않아 자동 입력이 불가합니다.\n\n등록하시려는 [단톡방 풀네임]을 직접 말씀해주세요.\n예시) 댕냥이/D/95/서울")
+                return True
+            
+            # 숫자와 영문자 포함 여부 검사
+            after = profile_line[len(nickname):len(nickname) + 15]
+            has_num = any(c.isdigit() for c in after)
+            has_eng = any("a" <= c.lower() <= "z" for c in after)
+            if not (has_num and has_eng):
+                bot_app.gyomu_mode[user_id] = "adopt_qna_step1"
+                ctx.reply(f"현재 프로필({profile_line}) 양식이 올바르지 않아 자동 입력이 불가합니다.\n\n등록하시려는 [단톡방 풀네임]을 직접 말씀해주세요.\n예시) 댕냥이/D/95/서울")
+                return True
+
+            # 검증 통과 시 바로 2단계로 진행
+            bot_app.gyomu_temp_adopt_data[user_id]["nick_name"] = profile_line
+            bot_app.gyomu_mode[user_id] = "adopt_qna_step2"
+            ctx.reply("키와 몸무게를 말씀해주세요.\n(체형 입력은 자유입니다)")
+            return True
+            
+        elif text == "아니오":
+            # 다른 프로필로 등록을 원하면 수동 입력 단계(step1)로 보냅니다.
+            bot_app.gyomu_mode[user_id] = "adopt_qna_step1"
+            ctx.reply("등록하시려는 [단톡방 풀네임]을 말씀해주세요.\n예시) 댕냥이/D/95/서울")
+            return True
+        else:
+            ctx.reply("올바른 응답이 아닙니다.\n[예] 또는 [아니오] 만 입력해주세요.")
+            return True
+
+    if current_mode == "adopt_qna_step1":
+        profile_line = msg.strip()
+        nick_match = re.match(r"^([가-힣]{1,5})", profile_line)
+        nickname = nick_match.group(1) if nick_match else None
+       
+        if not nickname or len(profile_line) <= len(nickname):
+            ctx.reply("[분양 양식 오류]\n\n프로필 양식을 다시 작성해주세요.\n예시) 댕냥이/D/95/서울")
+            return True
+       
+        after = profile_line[len(nickname):len(nickname) + 15]
+        has_num = any(c.isdigit() for c in after)
+        has_eng = any("a" <= c.lower() <= "z" for c in after)
+        if not (has_num and has_eng):
+            ctx.reply("[분양 양식 오류]\n\n프로필 양식을 다시 작성해주세요.\n예시) 댕냥이/D/95/서울")
+            return True
+           
+        bot_app.gyomu_temp_adopt_data[user_id]["nick_name"] = profile_line
+        bot_app.gyomu_mode[user_id] = "adopt_qna_step2"
+        ctx.reply("키와 몸무게를 말씀해주세요.\n(체형 입력은 자유입니다)")
+        return True
+
+    elif current_mode == "adopt_qna_step2":
+        numbers_found = re.findall(r'\d+', msg)
+        if len(numbers_found) < 2:
+            ctx.reply("[입력 오류]\n\n키와 몸무게 2가지 수치가 모두 필요해요.\n누락된 숫자가 없는지 확인 후 다시 입력해주세요.\n예시) 180 75 스탠")
+            return True
+
+        bot_app.gyomu_temp_adopt_data[user_id]["specification"] = msg.strip()
+        bot_app.gyomu_mode[user_id] = "adopt_qna_step3"
+        ctx.reply("원하시는 조건을 [초성]을 섞어\n자유롭게 말씀해주세요.\n(상대의 조건이나, 원하는 ㅍ등)")
+        return True
+
+    elif current_mode == "adopt_qna_step3":
+        bot_app.gyomu_temp_adopt_data[user_id]["memo"] = msg.strip()
+        bot_app.gyomu_mode[user_id] = "adopt_qna_step4"
+        ctx.reply("✅카카오프렌즈 입장 허용 설정이 된\n오픈카톡링크를 첨부해주세요.\n\n⚠️설정이 되지 않은 링크라면\n회원들의 연락이 가지 않습니다🙅‍♂️\n링크 전송 전, 반드시 설정을 확인해주세요")
+        return True
+
+    elif current_mode == "adopt_qna_step4":
+        if "https://open.kakao.com" not in msg:
+            ctx.reply("[오픈카톡링크 오류]\n\n🙅‍♂️오픈카톡 링크가 빠진 것 같아요\n✅링크를 다시 보내주세요")
+            return True
+           
+        m = re.search(r"(https?://open\.kakao\.com/[^\s]+)", msg, re.I)
+        link = m.group(1).strip() if m else msg.strip()
+       
+        bot_app.gyomu_temp_adopt_data[user_id]["link"] = link
+       
+        temp = bot_app.gyomu_temp_adopt_data[user_id]
+        confirm_text = (
+            f"A.단톡방 프로필 풀네임\n-> {temp['nick_name']}\n"
+            f"키/몸무게\n-> {temp['specification']}\n"
+            f"B.분양원하는조건(초성필수)\n-> {temp['memo']}\n"
+            f"C.오픈카톡링크 [카카오프렌즈 입장 허용]\n-> {temp['link']}"
+        )
+        bot_app.gyomu_mode[user_id] = "adopt_qna_step5"
+        ctx.reply(confirm_text)
+       
+        time.sleep(0.3)
+        ctx.reply("정보가 올바른지 확인해주세요\n[예 / 아니오] 입력")
+        return True
+
+    elif current_mode == "adopt_qna_step5":
+        if text == "아니오":
+            bot_app.gyomu_temp_adopt_data[user_id] = {}
+            # step1이 아닌 step1_confirm으로 되돌립니다.
+            bot_app.gyomu_mode[user_id] = "adopt_qna_step1_confirm" 
+            ctx.reply(f"처음부터 분양센터 등록을 다시 시작합니다.\n\n등록하시려는 프로필이\n[{author_profile}] 맞습니까?\n\n[예 / 아니오] 입력")
+            return True
+        elif text == "예":
+            temp = bot_app.gyomu_temp_adopt_data[user_id]
+            profile_line = temp["nick_name"]
+           
+            lower_name = author_profile.lower()
+            is_sw = ('sw' in lower_name or "newb" in lower_name or "new b" in lower_name or "nb" in lower_name)
+
+            if is_sw:
+                bot_app.gyomu_mode[user_id] = "adopt_qna_step_kind"
+                if not hasattr(bot_app, "gyomu_adopt_kind_prompt_type"):
+                    bot_app.gyomu_adopt_kind_prompt_type = {}
+                bot_app.gyomu_adopt_kind_prompt_type[user_id] = "sw"
+                ctx.reply('귀하는 SW 또는 Newb이십니다.\n\nS를 구하고 싶으신 경우 [고양이]\nD를 구하고 싶으신 경우 [강아지]\n를 입력해주세요.')
+                return True
+
+            inferred_type = infer_sale_type_from_profile_line(profile_line)
+            if not inferred_type:
+                bot_app.gyomu_mode[user_id] = "adopt_qna_step_kind"
+                if not hasattr(bot_app, "gyomu_adopt_kind_prompt_type"):
+                    bot_app.gyomu_adopt_kind_prompt_type = {}
+                bot_app.gyomu_adopt_kind_prompt_type[user_id] = "fail"
+                ctx.reply("귀하의 성향파악을 실패했습니다.\n\nS를 구하고 싶으신 경우 [고양이]\nD를 구하고 싶으신 경우 [강아지]\n를 입력해주세요.")
+                return True
+           
+            temp["type"] = inferred_type
+            temp["valid_month"] = sale_compute_valid_month()
+            return process_qna_final_registration(bot_app, ctx, user_id, temp, author_profile)
+        else:
+            ctx.reply("올바른 응답이 아닙니다. [예] 또는 [아니오] 만 입력해주세요.")
+            return True
+
+    elif current_mode == "adopt_qna_step_kind":
+        if text in ("고양이", "강아지"):
+            temp = bot_app.gyomu_temp_adopt_data[user_id]
+            inferred_type = "cat" if text == "고양이" else "dog"
+            temp["type"] = inferred_type
+            temp["valid_month"] = sale_compute_valid_month()
+            return process_qna_final_registration(bot_app, ctx, user_id, temp, author_profile)
+        else:
+            why = (getattr(bot_app, "gyomu_adopt_kind_prompt_type", {}) or {}).get(user_id)
+            if why == "fail": ctx.reply("귀하의 성향파악을 실패했습니다.\n\nS를 구하고 싶으신 경우 [고양이]\nD를 구하고 싶으신 경우 [강아지]\n를 입력해주세요.")
+            else: ctx.reply('귀하는 SW 또는 Newb이십니다.\n\nS를 구하고 싶으신 경우 [고양이]\nD를 구하고 싶으신 경우 [강아지]\n를 입력해주세요.')
+            return True
+
+    if text == "취소" and current_mode and current_mode.startswith("sale_edit_qna_"):
+        bot_app.gyomu_mode.pop(user_id, None)
+        if hasattr(bot_app, "gyomu_temp_edit_data"):
+            bot_app.gyomu_temp_edit_data.pop(user_id, None)
+        ctx.reply("진행 중인 분양글 수정을 취소했습니다. 처음 메뉴로 돌아갑니다.")
+        return True
+
+    if current_mode == "sale_edit_qna_step1":
+        input_text = msg.strip()
+        
+        # 빈 문자열 예외 처리
+        if not input_text:
+            ctx.reply("등록 당시 [단톡방 프로필 풀네임] 또는 [분양글 번호]를 정확히 보내주세요.\n예) 댕냥이/D/95/서울 또는 123")
+            return True
+
+        row = None
+        is_id_search = False
+        
+        # 💡 에러의 원인이었던 import re 를 삭제했습니다.
+        numeric_only = re.sub(r"[^\d]", "", input_text)
+        
+        # 💡 숫자가 실제로 존재하는지 먼저 확인하는 안전망을 추가했습니다.
+        if numeric_only and ("#" in input_text or input_text.isdigit() or input_text.endswith("번")):
+            is_id_search = True
+            sale_id = int(numeric_only)
+            
+            # ID로 데이터베이스 직접 조회
+            ok_find, err_find, data = sale_get({"id": f"eq.{sale_id}"})
+            if ok_find and isinstance(data, list) and len(data) > 0:
+                row = data[0]
+        else:
+            # 기존 프로필 이름 검색 로직
+            ok_find, err_find, row = sale_find_latest_row_by_profile_line(input_text)
+            if not row:
+                nickname = extract_kor_nickname_from_profile_line(input_text)
+                if nickname:
+                    _, _, row = sale_find_latest_row_by_nickname_prefix(nickname)
+                
+        # 데이터가 없을 때의 분기 안내
+        if not row:
+            if is_id_search:
+                ctx.reply(f"번호가 [ {numeric_only} ]인 분양글을 찾지 못했어요.\n번호가 정확한지 분양센터에서 다시 확인해 주세요.")
+            else:
+                ctx.reply("해당 프로필로 등록된 분양글을 찾지 못했어요.\n등록 당시 [단톡방 풀네임]이 정확한지 확인 후 다시 보내주세요.")
+            return True
+
+        bot_app.gyomu_temp_edit_data[user_id]["target_row"] = row
+       
+        bot_app.gyomu_mode[user_id] = "sale_edit_qna_step2"
+        ctx.reply("분양글을 찾았습니다!\n\n수정 후 새롭게 반영될\n[현재 단톡방 풀네임]을 입력해주세요.\n(변경이 없다면 기존과 동일하게 적어주세요)\nex)댕냥이/D/95/서울")
+        return True
+
+    elif current_mode == "sale_edit_qna_step2":
+        profile_line = msg.strip()
+        nick_match = re.match(r"^([가-힣]{1,5})", profile_line)
+        nickname = nick_match.group(1) if nick_match else None
+       
+        if not nickname or len(profile_line) <= len(nickname):
+            ctx.reply("[분양 양식 오류]\n\n프로필 양식을 다시 작성해주세요.\n예시) 댕냥이/D/95/서울")
+            return True
+       
+        after = profile_line[len(nickname):len(nickname) + 15]
+        has_num = any(c.isdigit() for c in after)
+        has_eng = any("a" <= c.lower() <= "z" for c in after)
+        if not (has_num and has_eng):
+            ctx.reply("[분양 양식 오류]\n\n프로필 양식을 다시 작성해주세요.\n예시) 댕냥이/D/95/서울")
+            return True
+           
+        bot_app.gyomu_temp_edit_data[user_id]["nick_name"] = profile_line
+        bot_app.gyomu_mode[user_id] = "sale_edit_qna_step3"
+        ctx.reply("수정하실 [키/몸무게]를 말씀해주세요.\n(변경하지 않으시려면 기존 내용을 그대로 적어주세요)")
+        return True
+
+    elif current_mode == "sale_edit_qna_step3":
+        numbers_found = re.findall(r'\d+', msg)
+        if len(numbers_found) < 2:
+            ctx.reply("[입력 오류]\n\n키와 몸무게 2가지 수치가 모두 필요해요.\n누락된 숫자가 없는지 확인 후 다시 입력해주세요.\n예시) 180 75 스탠")
+            return True
+
+        bot_app.gyomu_temp_edit_data[user_id]["specification"] = msg.strip()
+        bot_app.gyomu_mode[user_id] = "sale_edit_qna_step4"
+        ctx.reply("수정하실 [원하는 조건]을 초성을 섞어 말씀해주세요.\n(변경하지 않으시려면 기존 내용을 그대로 적어주세요)")
+        return True
+
+    elif current_mode == "sale_edit_qna_step4":
+        bot_app.gyomu_temp_edit_data[user_id]["memo"] = msg.strip()
+        bot_app.gyomu_mode[user_id] = "sale_edit_qna_step5"
+        ctx.reply("수정하실 [오픈카톡링크]를 첨부해주세요.\n\n⚠️설정이 되지 않은 링크라면\n회원들의 연락이 가지 않습니다🙅‍♂️\n링크 전송 전, 반드시 설정을 확인해주세요")
+        return True
+
+    elif current_mode == "sale_edit_qna_step5":
+        if "https://open.kakao.com" not in msg:
+            ctx.reply("[오픈카톡링크 오류]\n\n🙅‍♂️오픈카톡 링크가 빠진 것 같아요\n✅링크를 다시 보내주세요")
+            return True
+           
+        m = re.search(r"(https?://open\.kakao\.com/[^\s]+)", msg, re.I)
+        link = m.group(1).strip() if m else msg.strip()
+        bot_app.gyomu_temp_edit_data[user_id]["link"] = link
+       
+        temp = bot_app.gyomu_temp_edit_data[user_id]
+        confirm_text = (
+            f"A.단톡방 프로필 풀네임\n-> {temp['nick_name']}\n"
+            f"키/몸무게\n-> {temp['specification']}\n"
+            f"B.분양원하는조건(초성필수)\n-> {temp['memo']}\n"
+            f"C.오픈카톡링크 [카카오프렌즈 입장 허용]\n-> {temp['link']}"
+        )
+        bot_app.gyomu_mode[user_id] = "sale_edit_qna_step6"
+        ctx.reply("[수정될 내용 미리보기]\n\n" + confirm_text)
+       
+        time.sleep(0.3)
+        ctx.reply("위 내용으로 수정하시겠습니까?\n[예 / 아니오] 입력")
+        return True
+
+    elif current_mode == "sale_edit_qna_step6":
+        if text == "아니오":
+            bot_app.gyomu_temp_edit_data[user_id] = {}
+            bot_app.gyomu_mode[user_id] = "sale_edit_qna_step1"
+            ctx.reply("수정을 취소하고 처음부터 다시 시작합니다.\n등록 당시의 [단톡방 풀네임]을 입력해주세요.")
+            return True
+        elif text == "예":
+            temp = bot_app.gyomu_temp_edit_data[user_id]
+            profile_line = temp["nick_name"]
+           
+            lower_name = author_profile.lower()
+            is_sw = ('sw' in lower_name or "newb" in lower_name or "new b" in lower_name or "nb" in lower_name)
+
+            if is_sw:
+                bot_app.gyomu_mode[user_id] = "sale_edit_qna_step_kind"
+                if not hasattr(bot_app, "gyomu_sale_edit_kind_prompt_type"):
+                    bot_app.gyomu_sale_edit_kind_prompt_type = {}
+                bot_app.gyomu_sale_edit_kind_prompt_type[user_id] = "sw"
+                ctx.reply('귀하는 SW 또는 Newb이십니다.\n\nS를 구하고 싶으신 경우 [고양이]\nD를 구하고 싶으신 경우 [강아지]\n를 입력해주세요.')
+                return True
+
+            inferred_type = infer_sale_type_from_profile_line(profile_line)
+            if not inferred_type:
+                bot_app.gyomu_mode[user_id] = "sale_edit_qna_step_kind"
+                if not hasattr(bot_app, "gyomu_sale_edit_kind_prompt_type"):
+                    bot_app.gyomu_sale_edit_kind_prompt_type = {}
+                bot_app.gyomu_sale_edit_kind_prompt_type[user_id] = "fail"
+                ctx.reply("귀하의 성향파악을 실패했습니다.\n\nS를 구하고 싶으신 경우 [고양이]\nD를 구하고 싶으신 경우 [강아지]\n를 입력해주세요.")
+                return True
+           
+            temp["type"] = inferred_type
+            temp["valid_month"] = sale_compute_valid_month()
+            return process_qna_final_edit(bot_app, ctx, user_id, temp, author_profile)
+        else:
+            ctx.reply("올바른 응답이 아닙니다. [예] 또는 [아니오] 만 입력해주세요.")
+            return True
+
+    elif current_mode == "sale_edit_qna_step_kind":
+        if text in ("고양이", "강아지"):
+            temp = bot_app.gyomu_temp_edit_data[user_id]
+            inferred_type = "cat" if text == "고양이" else "dog"
+            temp["type"] = inferred_type
+            temp["valid_month"] = sale_compute_valid_month()
+            return process_qna_final_edit(bot_app, ctx, user_id, temp, author_profile)
+        else:
+            why = (getattr(bot_app, "gyomu_sale_edit_kind_prompt_type", {}) or {}).get(user_id)
+            if why == "fail": ctx.reply("귀하의 성향파악을 실패했습니다.\n\nS를 구하고 싶으신 경우 [고양이]\nD를 구하고 싶으신 경우 [강아지]\n를 입력해주세요.")
+            else: ctx.reply('귀하는 SW 또는 Newb이십니다.\n\nS를 구하고 싶으신 경우 [고양이]\nD를 구하고 싶으신 경우 [강아지]\n를 입력해주세요.')
+            return True
+
+    if current_mode == "sale_delete_wait_profile":
+        # 1. 입력값 정제
+        m = re.search(r"단톡방 프로필 풀네임\s*->\s*([^\n]+)", msg, re.I)
+        input_text = m.group(1).strip() if m else text.strip()
+
+        if not input_text:
+            ctx.reply("등록 당시 [단톡방 프로필 풀네임] 또는 [분양글 번호]를 정확히 보내주세요.\n예) 댕냥이/D/95/서울 또는 123")
+            return True
+
+        row = None
+        is_id_search = False
+
+        # 2. 번호인지 프로필인지 판별 (숫자만 추출)
+        # 💡 에러의 원인이었던 import re 를 삭제했습니다.
+        numeric_only = re.sub(r"[^\d]", "", input_text)
+        
+        # 💡 숫자가 실제로 존재하는지 먼저 확인하는 안전망을 추가했습니다.
+        if numeric_only and ("#" in input_text or input_text.isdigit() or input_text.endswith("번")):
+            is_id_search = True
+            sale_id = int(numeric_only)
+            
+            # ID로 데이터베이스 직접 조회
+            ok_find, err_find, data = sale_get({"id": f"eq.{sale_id}"})
+            if ok_find and isinstance(data, list) and len(data) > 0:
+                row = data[0]
+        else:
+            # 기존 프로필 이름 검색 로직
+            ok_find, err_find, row = sale_find_latest_row_by_profile_line(input_text)
+            if not row:
+                nickname = extract_kor_nickname_from_profile_line(input_text)
+                if nickname:
+                    _, _, row = sale_find_latest_row_by_nickname_prefix(nickname)
+
+        # 3. 데이터가 없을 때의 안내
+        if not row:
+            if is_id_search:
+                ctx.reply(f"번호가 [ {numeric_only} ]인 분양글을 찾지 못했어요.\n번호가 정확한지 분양센터에서 다시 확인해 주세요.")
+            else:
+                ctx.reply("해당 프로필로 등록된 분양글을 찾지 못했어요.\n등록 당시 [단톡방 프로필 풀네임]이 정확한지 확인 후 다시 보내주세요.")
+            return True
+
+        # 4. 삭제 진행
+        sale_id = row.get("id")
+        ok, err, data = sale_delete_by_id(sale_id)
+
+        try: send_oper_sale_delete_notice(bot_app, ok, author_profile, row, data, err)
+        except Exception: pass
+
+        if ok: 
+            ctx.reply(f"[{author_profile}] 님!\n요청하신 분양글을\n[자동삭제] 처리했습니다🗑️\n\n추가 문의가 없으시다면\n[퇴장]부탁드립니다.🚪🏃")
+        else: 
+            ctx.reply("분양글 자동삭제에 실패했습니다.\n운영진이 확인할게요.\n\n추가 문의가 없으시다면\n[퇴장]부탁드립니다.🚪")
+
+        bot_app.gyomu_mode.pop(user_id, None)
+        bot_app.gyomu_gemini_on[user_id] = False
+        bot_app.gyomu_chat_history.pop(user_id, None)
+        return True
+
+    allowed_triggers = ["메뉴를 고르실때는 간략하게","15","당했는지?","1","11","12","13","14","2","21","22","3","4","41","42","43","44","5","51","52","53","54","예","아니오","고양이","강아지","단톡방 프로필 풀네임","가이드","6","취소"]
+    if text not in allowed_triggers and "메뉴를 고르실때는 간략하게" not in msg and "당했는지?" not in msg:
+        if bot_app.gyomu_gemini_on.get(user_id) and not bot_app.gyomu_global_gemini_disabled:
+            handle_gyomu_gemini_chat(bot_app, ctx, msg)
+        return True
+
+    if text == '6':
+        bot_app.gyomu_gemini_on[user_id] = False
+        bot_app.gyomu_mode.pop(user_id, None)
+        bot_app.gyomu_chat_history.pop(user_id, None)
+        ctx.reply('[초대받고 왔어요]\n어서오세요🙋\n운영진이 확인하는대로\n응대해드리겠습니다\n\n초대해주신 지인의\n단톡방 프로필을 남겨주시면\n응대가 빠릅니다')
+        return True
+
+    blocked_profile_parts = ["20","21","22","23","24","25","26","27","28","29","30","31","32","33","34","35","36","37","38","39","40","41","42","43","44","45","46","47","48","49","50","51","52","53","54","55","56","57","58","59","60","9n","9N","0n","0N","2n","3n","4n","5n","2N","3N","4N","5N"]
+    for ban in blocked_profile_parts:
+        if ban in author_profile:
+            ctx.reply('⛔프로필 양식이\n올바르지 않습니다.\n프로필을 규정에 맞게 수정하신다음\n반드시 재입장 하셔야 상담이 가능합니다')
+            return True
+
+    has_kor = any('\uac00' <= c <= '\ud7a3' for c in author_profile)
+    has_eng = any('a' <= c.lower() <= 'z' for c in author_profile)
+    has_num = any(c.isdigit() for c in author_profile)
+
+    is_teacher_or_bot = ('담임' in author_profile or '오픈채팅봇' in author_profile or '학교장' in author_profile)
+
+    if not (has_kor and has_eng and has_num) and not is_teacher_or_bot:
+        ctx.reply('⛔프로필 양식이 올바르지 않습니다\n프로필을 규정에 맞게 수정하신다음\n반드시 재입장 하셔야 상담이 가능합니다\n\n프로필 규정\n[한글닉네임/역할/출생년도/지역]')
+        return True
+
+    if ('메뉴를 고르실때는 간략하게' in msg) or (text == '15'):
+        bot_app.gyomu_gemini_on[user_id] = True
+        bot_app.gyomu_mode[user_id] = "menu"
+        bot_app.gyomu_chat_history.pop(user_id, None)
+        ctx.reply(f"[{author_profile}] 님, 안녕하세요!🙋\n저는 AI상담사입니다🙇\n[댕냥이 유치원]과 동일한\n프로필이 아니면 상담 불가합니다⛔️\n메뉴를 고르실때는 간략하게\n[숫자] 또는 [제시된단어]만\n✅정확히 입력 후 전송해주세요\n\n방문하신 [목적]에 해당하는\n숫자를 채팅창에 입력해주세요\n\n1 - 분양센터 관련\n2 - 외출/복귀 문의\n3 - 지인초대 문의\n4 - 기타 문의,제보\n5 - 퇴학 후 문의\n6 - 초대받고 왔어요🙋")
+
+    if text == '1':
+        bot_app.gyomu_gemini_on[user_id] = False
+        bot_app.gyomu_mode.pop(user_id, None)
+        bot_app.gyomu_chat_history.pop(user_id, None)
+        ctx.reply('분양센터 [신규등록] - 11\n등록된 분양글 [수정] - 12\n등록된 분양글 [삭제] - 13\n\n해당되는 숫자를 입력해주세요.')
+    if text == '11':
+        bot_app.gyomu_gemini_on[user_id] = False
+        # 모드를 step1_confirm으로 변경합니다.
+        bot_app.gyomu_mode[user_id] = "adopt_qna_step1_confirm" 
+        bot_app.gyomu_chat_history.pop(user_id, None)
+        if not hasattr(bot_app, "gyomu_temp_adopt_data"):
+            bot_app.gyomu_temp_adopt_data = {}
+        bot_app.gyomu_temp_adopt_data[user_id] = {}
+        
+        # 안내 메시지 변경
+        ctx.reply(f"분양센터 등록을 시작합니다.\n\n등록하시려는 프로필이\n[{author_profile}] 맞습니까?\n\n[예 / 아니오] 입력")
+        return True
+    if text == '12':
+        bot_app.gyomu_gemini_on[user_id] = False
+        bot_app.gyomu_mode[user_id] = "sale_edit_qna_step1"
+        bot_app.gyomu_chat_history.pop(user_id, None)
+        if not hasattr(bot_app, "gyomu_temp_edit_data"):
+            bot_app.gyomu_temp_edit_data = {}
+        bot_app.gyomu_temp_edit_data[user_id] = {}
+        ctx.reply("[분양글 수정]\n\n수정하실 분양글을 찾기 위해\n등록 당시의 [단톡방 풀네임] 또는 [분양글 번호]를 입력해주세요.\n(분양글 번호는 분양센터 게시글 우측 하단 #숫자 로 확인 가능합니다)\n\n예) 댕냥이/D/95/서울\n예) 123 또는 #123")
+        return True
+    if text == '13':
+        bot_app.gyomu_gemini_on[user_id] = False
+        bot_app.gyomu_mode[user_id] = "sale_delete_wait_profile"
+        bot_app.gyomu_chat_history.pop(user_id, None)
+        ctx.reply("[분양글 자동삭제]\n\n등록 당시의 [단톡방 프로필 풀네임] 또는 [분양글 번호]를 보내주세요.\n(분양글 번호는 분양센터 게시글 우측 하단 #숫자 로 확인 가능합니다)\n\n예) 댕냥이/D/95/서울\n예) 123 또는 #123")
+        return True
+    if text == '2':
+        bot_app.gyomu_gemini_on[user_id] = False
+        bot_app.gyomu_mode.pop(user_id, None)
+        bot_app.gyomu_chat_history.pop(user_id, None)
+        ctx.reply('[외출]문의 - 21\n[복귀]문의 - 22\n해당되는 숫자를 입력해주세요.')
+    if text == '21':
+        bot_app.gyomu_gemini_on[user_id] = True
+        bot_app.gyomu_mode[user_id] = "out_reason"
+        bot_app.gyomu_chat_history.pop(user_id, None)
+        ctx.reply(f"[{author_profile}] 님!\n외출하시는 사유를 간단히 말씀 부탁드립니다🙂\n\n자세한 내용이 아니어도 괜찮습니다.")
+    if text == '22':
+        bot_app.gyomu_gemini_on[user_id] = False
+        bot_app.gyomu_mode.pop(user_id, None)
+        bot_app.gyomu_chat_history.pop(user_id, None)
+
+        # 1차 검증: 고유 ID로 즉시 확인
+        if user_id in bot_app.out_db.out_users:
+            # 저장된 데이터에서 이름을 가져옵니다.
+            user_data = bot_app.out_db.out_users[user_id]
+            stored_name = user_data.get("profile", author_profile) # 이름이 없으면 현재 이름 사용
+
+            # ✅ 1차 검증 성공 시에만 알림 전송
+            _send_return_success_notifications(bot_app, ctx, stored_name, user_id)
+            return True
+        else:
+            # ❌ 1차 검증 실패 시: 이름을 물어보는 단계로 진입 (운영방 알림 보내지 않음)
+            bot_app.gyomu_mode[user_id] = "return_verify"
+            ctx.reply("외출 기록을 찾지 못 했습니다\n\n외출 신청 시 사용하셨던\n[단톡방 프로필 풀네임]을 입력해주세요")
+            return True
+    if text == '3':
+        bot_app.gyomu_gemini_on[user_id] = False
+        bot_app.gyomu_mode.pop(user_id, None)
+        bot_app.gyomu_chat_history.pop(user_id, None)
+        ctx.reply(f"[{author_profile}] 님!\n지인 초대의 경우 아래 링크를\n지인에게 공유해주시면\n운영진이 응대해드릴게요😊\n\n지인에게 단톡 프로필양식을 미리 공유해주세요!\n\nhttps://open.kakao.com/o/g7YxFiGg")
+    if text == '4':
+        bot_app.gyomu_gemini_on[user_id] = False
+        bot_app.gyomu_mode.pop(user_id, None)
+        bot_app.gyomu_chat_history.pop(user_id, None)
+        ctx.reply('용무가\n[제보/신고] 인 경우 - 41\n[문의] 인 경우 - 42\n\n해당되는 숫자를 입력해주세요.')
+    if text == '41':
+        bot_app.gyomu_gemini_on[user_id] = False
+        bot_app.gyomu_mode.pop(user_id, None)
+        ctx.reply('[제보/신고 문의입니다]\n\n내용이 운영진과\n상담이 필요한 경우 - 43\n\n내용의 증거가 충분해\n증거제출로 충분히 소명되는 경우 - 44\n\n해당되는 숫자를 입력해주세요.')
+    if text == '42':
+        bot_app.gyomu_gemini_on[user_id] = False
+        bot_app.gyomu_mode.pop(user_id, None)
+        ctx.reply('[문의 요청]입니다.\n\n먼저 문의 내용을 남겨주시면\n운영진 확인 후 응대해드릴게요')
+    if text == '43':
+        bot_app.gyomu_gemini_on[user_id] = False
+        bot_app.gyomu_mode.pop(user_id, None)
+        ctx.reply('[상담 요청]\n\n운영진에게 요청을 전송했어요\n\n먼저 문의하실 내용을 남겨주세요')
+    if text == '44':
+        bot_app.gyomu_gemini_on[user_id] = False
+        bot_app.gyomu_mode.pop(user_id, None)
+        ctx.reply('[증거자료]와 의견을 남겨주시면\n운영진 확인 후\n필요한 경우 연락드립니다\n\n자료제출이 끝나면\n[퇴장]해주시면 됩니다.')
+    if text == '5':
+        bot_app.gyomu_gemini_on[user_id] = False
+        bot_app.gyomu_mode.pop(user_id, None)
+        bot_app.gyomu_chat_history.pop(user_id, None)
+        ctx.reply('[퇴학 문의입니다]\n\n퇴학 사유를 아는 경우 - 51\n퇴학 사유를 모르는 경우 - 52\n해당되는 숫자를 입력해주세요.')
+    if text == '51':
+        bot_app.gyomu_gemini_on[user_id] = False
+        bot_app.gyomu_mode.pop(user_id, None)
+        ctx.reply('[퇴학 사유]가\n\n프로필 규정 위반인 경우 - 53\n기타 규정 위반인 경우 - 54\n해당되는 숫자를 입력해주세요.')
+    if text == '52':
+        bot_app.gyomu_gemini_on[user_id] = False
+        bot_app.gyomu_mode.pop(user_id, None)
+        ctx.reply('[퇴학 사유 문의]\n\n잠시만 기다려주시면\n운영진 확인 후\n[재입학]도와드리겠습니다.')
+    if text == '53':
+        bot_app.gyomu_gemini_on[user_id] = False
+        bot_app.gyomu_mode.pop(user_id, None)
+        ctx.reply('우리방 프로필 규정은\n[한글닉네임/역할/출생년도/지역]\n입니다\n\n규정에 맞게 프로필을 수정하시고\n잠시 기다리시면 운영진 확인 후\n재입학 도와드리겠습니다.')
+    if text == '54':
+        bot_app.gyomu_gemini_on[user_id] = False
+        bot_app.gyomu_mode.pop(user_id, None)
+        ctx.reply('첨부해드린 양식을 복사 후\n작성해서 보내주세요\n사유는 간단명료하게 적어주세요.')
+        ctx.reply('재입학 신청서\nA.단톡방 프로필 풀네임\n->\nB.왜 퇴학(내보내기) 당했는지?\n->\nC.재입학 후 나의 다짐\n->')
+    if "당했는지?" in msg:
+        ctx.reply('잠시 기다리시면\n운영진 확인 후\n[재입학]도와드리겠습니다.\n\n작성하신 [재입학 신청서]는\n재입장 시 최초1회\n단톡방에 공유해주셔야합니다.')
+
+    return True
+
+def _send_return_success_notifications(bot_app, ctx, profile_name, target_uid):
+    from Main import OPER_ROOM_ID, KINDERGARTEN_ROOM_ID
+    
+    # 1. 사용자에게 링크 전송
+    reply_text = (
+        f"[{profile_name}] 님! 확인되었습니다. 그리웠어요👋\n"
+        "https://open.kakao.com/o/gEoBZa0e\n\n참여코드 [5877]\n\n"
+        "🙋🏻‍♂️본 단톡방 입장 후에는 [교무실]은 퇴장 부탁드립니다!"
+    )
+    ctx.reply(reply_text)
+
+    # 2. 운영방에 성공 알림 (이제 여기서 보냅니다!)
+    try:
+        admin_msg = f"✅ 복귀 완료 알림\n작성자: {profile_name}\n(정상적으로 검증되었습니다)"
+        bot_app.bot.api.reply(OPER_ROOM_ID, admin_msg)
+    except: pass
+
+    # 3. 유치원방에 환영 메시지 전송
+    try:
+        k_msg = f"🏃‍♂️ [{profile_name}] 님이 곧 유치원으로 복귀하실 예정입니다!\n다들 따뜻하게 환영해 주세요! 🥳👋"
+        bot_app.bot.api.reply(KINDERGARTEN_ROOM_ID, k_msg)
+    except: pass
+
+    # 4. DB에서 제거
+    bot_app.out_db.remove_user(target_uid)

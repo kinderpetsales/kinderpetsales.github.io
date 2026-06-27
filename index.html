@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>댕냥이 유치원 프로필</title>
+    <style>
+        body {
+            font-family: 'Malgun Gothic', sans-serif;
+            background-color: #f4f4f9;
+            margin: 0;
+            padding: 20px;
+        }
+        h1 { text-align: center; color: #333; }
+        
+        /* 카테고리 탭 디자인 */
+        .tabs {
+            display: flex;
+            justify-content: center;
+            margin-bottom: 30px;
+            gap: 10px;
+        }
+        .tab-btn {
+            padding: 10px 30px;
+            font-size: 18px;
+            font-weight: bold;
+            border: none;
+            border-radius: 20px;
+            cursor: pointer;
+            background-color: #ddd;
+            color: #555;
+            transition: 0.3s;
+        }
+        .tab-btn.active { background-color: #ff9800; color: white; }
+        
+        /* 포스트잇 그리드 레이아웃 */
+        .memo-container {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+            gap: 20px;
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        
+        /* 포스트잇 디자인 */
+        .post-it {
+            background-color: #feff9c;
+            width: 100%;
+            height: 250px;
+            padding: 20px;
+            box-sizing: border-box;
+            box-shadow: 3px 5px 10px rgba(0,0,0,0.15);
+            position: relative;
+            display: flex;
+            flex-direction: column;
+            transform: rotate(-1deg);
+            transition: transform 0.2s;
+        }
+        .post-it:nth-child(even) { transform: rotate(1deg); }
+        .post-it:hover { transform: scale(1.05); z-index: 10; }
+        
+        .name { font-size: 22px; font-weight: bold; border-bottom: 2px solid #e0c55f; padding-bottom: 5px; margin-bottom: 10px;}
+        .hw { font-size: 14px; color: #555; margin-bottom: 10px; }
+        .intro { flex-grow: 1; font-size: 15px; line-height: 1.4; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; }
+        
+        /* 하단 정보 (월 / 번호 / 링크) */
+        .footer { display: flex; justify-content: space-between; align-items: center; margin-top: 10px; font-size: 12px; color: #666; font-weight: bold;}
+        .link-btn { background-color: #4CAF50; color: white; text-decoration: none; padding: 5px 10px; border-radius: 5px; font-size: 12px; }
+    </style>
+</head>
+<body>
+
+    <h1>🐾 댕냥이 유치원 분양 프로필 🐾</h1>
+    
+    <div class="tabs">
+        <button class="tab-btn active" onclick="filterCategory('강아지', this)">🐶 강아지</button>
+        <button class="tab-btn" onclick="filterCategory('고양이', this)">🐱 고양이</button>
+    </div>
+
+    <div class="memo-container" id="memo-board">
+        </div>
+
+    <script>
+        // 파이썬 코드와 동일한 Firebase URL을 입력하세요.
+        const DB_URL = "https://your-project-id-default-rtdb.firebaseio.com/memos.json";
+        let allMemos = [];
+
+        async function loadMemos() {
+            try {
+                const response = await fetch(DB_URL);
+                const data = await response.json();
+                if(data) {
+                    // 객체 형태를 배열로 변환
+                    allMemos = Object.values(data);
+                    // 기본값 '강아지' 렌더링
+                    renderMemos('강아지');
+                }
+            } catch (error) {
+                console.error("데이터를 불러오는 중 오류 발생:", error);
+            }
+        }
+
+        function filterCategory(category, element) {
+            // 탭 디자인 변경
+            document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
+            element.classList.add('active');
+            
+            // 데이터 렌더링
+            renderMemos(category);
+        }
+
+        function renderMemos(category) {
+            const board = document.getElementById('memo-board');
+            board.innerHTML = ''; 
+
+            const filteredMemos = allMemos.filter(memo => memo.category === category);
+            
+            filteredMemos.forEach(memo => {
+                const postIt = document.createElement('div');
+                postIt.className = 'post-it';
+                
+                postIt.innerHTML = `
+                    <div class="name">${memo.name}</div>
+                    <div class="hw">📏 ${memo.hw}</div>
+                    <div class="intro">${memo.intro}</div>
+                    <div class="footer">
+                        <span>📅 ${memo.month}월 분양</span>
+                        <a href="${memo.link}" target="_blank" class="link-btn">오픈톡 연결</a>
+                        <span>#${memo.id.slice(-4)}</span>
+                    </div>
+                `;
+                board.appendChild(postIt);
+            });
+        }
+
+        // 페이지 로드 시 데이터 가져오기
+        window.onload = loadMemos;
+    </script>
+</body>
+</html>

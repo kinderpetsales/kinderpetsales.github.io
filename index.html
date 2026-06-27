@@ -21,7 +21,7 @@
       overflow-x: auto;
     }
 
-    /* 제목 - 모바일 화면에서도 잘리지 않도록 max-width 구조로 개선 */
+    /* 제목 */
     h2{
       max-width: 900px;
       width: 100%;
@@ -34,7 +34,7 @@
       box-sizing: border-box;
     }
 
-    /* 필터 버튼 영역 - 모바일에서 버튼이 밀릴 때 아래로 자연스럽게 정렬되도록 flex-wrap 추가 */
+    /* 필터 버튼 영역 */
     .filter-box{
       max-width: 900px;
       width: 100%;
@@ -63,7 +63,7 @@
       font-weight: 700;
     }
 
-    /* ⭐ 새롭게 추가된 지역 선택 드롭다운 스타일 */
+    /* 지역 선택 드롭다운 스타일 */
     .region-select {
       padding: 6px 12px;
       border-radius: 8px;
@@ -74,7 +74,7 @@
       outline: none;
     }
 
-    /* 고정형 가로폭 대신 화면 크기에 맞춰 열 개수가 변하는 유연한 보드로 개선 */
+    /* 게시판 메인 보드 */
     .board{
       max-width: 900px;
       width: 100%;
@@ -110,11 +110,9 @@
       left: 10px;
       right: 10px;
       bottom: 8px;
-
       display: flex;
       justify-content: space-between;
       align-items: center;
-
       font-size: 11px;
       color: #6b5a00;
       opacity: 0.6;
@@ -126,11 +124,9 @@
       left: 50%;
       transform: translateX(-50%);
       top: -2px;
-
       background: none;
       width: auto;
       height: auto;
-
       display: block;
       color: #d33;
       font-size: 20px;
@@ -138,7 +134,7 @@
       box-shadow: none;
     }
 
-    /* 텍스트 */
+    /* 텍스트 스타일 */
     h1{
       margin: 10px 0 0 0;
       font-size:17px;
@@ -201,7 +197,6 @@
 
     async function loadData() {
       try {
-        // [디테일 반영] 데이터를 불러오는 동안 화면이 텅 비지 않도록 로딩 메시지 표시
         document.getElementById("board").innerHTML = `
           <div style="grid-column: 1 / -1; text-align: center; color: #888; padding: 50px 0;">
             데이터를 불러오는 중입니다... 🐾
@@ -232,8 +227,11 @@
         const catCount = data.filter(item => item.type === "cat").length;
 
         updateTitle(dogCount, catCount);
+        
+        // ⭐ 최초 로드 시 각 지역별 등록 동물의 숫자를 화면에 반영합니다.
+        updateRegionCounts();
 
-        // 첫 로딩 시, 정해진 필터 조건(강아지 + 전체지역)에 맞는 것만 출력
+        // 첫 로딩 시 화면 출력
         renderCards(filterData());
 
       } catch (err) {
@@ -294,7 +292,26 @@
       countEl.textContent = `(today : ${count})`;
     }
 
-    /* ⭐ 핵심 로직: 동물 종류와 지역 조건 2가지를 동시에 검사하여 필터링 */
+    /* ⭐ 새롭게 추가된 함수: 현재 카테고리(개/고양이)에 맞는 지역별 카테고리 숫자를 계산하여 드롭다운 갱신 */
+    function updateRegionCounts() {
+      const regions = ["서울", "경기", "강원", "충청", "경상", "전라", "제주"];
+      
+      // 1. 전체 지역 텍스트 갱신 (현재 선택된 동물의 총합)
+      const allCount = allData.filter(item => item.type === currentType).length;
+      const allOption = document.querySelector('#region-select option[value="all"]');
+      if (allOption) allOption.textContent = `📍 전체 지역 (${allCount})`;
+
+      // 2. 루프를 돌며 각 지역 옵션 옆에 (개수) 추가하기
+      regions.forEach(region => {
+        const count = allData.filter(item => item.type === currentType && item.region === region).length;
+        const option = document.querySelector(`#region-select option[value="${region}"]`);
+        if (option) {
+          option.textContent = `${region} (${count})`;
+        }
+      });
+    }
+
+    /* 동물 종류와 지역 조건 2가지를 동시에 검사하여 필터링 */
     function filterData() {
       return allData.filter(item => {
         const matchType = item.type === currentType;
@@ -308,11 +325,10 @@
       const board = document.getElementById("board");
       board.innerHTML = "";
 
-      // [디테일 반영] 선택한 지역에 조건에 맞는 아이템이 한 개도 없을 때 예외 안내 처리
       if (data.length === 0) {
         board.innerHTML = `
           <div style="grid-column: 1 / -1; text-align: center; color: #999; padding: 60px 0; font-size: 15px;">
-            선택하신 지역에 등록된 댕냥이가 없습니다. 🐾
+            선택하신 지역에 등록된 동물이 없습니다. 🐾
           </div>
         `;
         return;
@@ -362,16 +378,18 @@
     document.getElementById("btn-dog").addEventListener("click", () => {
       currentType = "dog";
       setActive("dog");
+      updateRegionCounts(); // ⭐ 강아지 탭 클릭 시 강아지 숫자로 드롭다운 동적 업데이트
       renderCards(filterData());
     });
 
     document.getElementById("btn-cat").addEventListener("click", () => {
       currentType = "cat";
       setActive("cat");
+      updateRegionCounts(); // ⭐ 고양이 탭 클릭 시 고양이 숫자로 드롭다운 동적 업데이트
       renderCards(filterData());
     });
 
-    /* ⭐ 새롭게 추가된 드롭다운 선택 이벤트 */
+    /* 드롭다운 선택 이벤트 */
     document.getElementById("region-select").addEventListener("change", (event) => {
       currentRegion = event.target.value;
       renderCards(filterData());
